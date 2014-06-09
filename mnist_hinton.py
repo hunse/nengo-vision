@@ -23,7 +23,7 @@ class RBM(object):
 
     # --- define RBM parameters
     def __init__(self, vis_shape, n_hid,
-                 input=None, W=None, c=None, b=None,
+                 W=None, c=None, b=None, mask=None,
                  gaussian=None, rf_shape=None, seed=9):
         self.dtype = theano.config.floatX
 
@@ -32,7 +32,8 @@ class RBM(object):
         self.n_hid = n_hid
         self.gaussian = gaussian
         self.seed = seed
-        self.input = input if input is not None else tt.dmatrix('input')
+        self.pre = None
+        self.post = None
 
         rng = np.random.RandomState(seed=self.seed)
         self.theano_rng = theano.sandbox.rng_mrg.MRG_RandomStreams(seed=self.seed)
@@ -52,8 +53,9 @@ class RBM(object):
 
         # create initial sparsity mask
         self.rf_shape = rf_shape
-        if rf_shape is not None:
-            # assert isinstance(vis_shape, tuple) and len(vis_shape) == 2
+        self.mask = mask
+        if rf_shape is not None and mask is None:
+            assert isinstance(vis_shape, tuple) and len(vis_shape) == 2
             M, N = vis_shape
             m, n = rf_shape
 
@@ -67,8 +69,6 @@ class RBM(object):
 
             self.mask = mask.reshape(self.n_vis, self.n_hid)
             W = W * self.mask  # make initial W sparse
-        else:
-            self.mask = None
 
         # create states for weights and biases
         W = W.astype(self.dtype)
@@ -83,6 +83,20 @@ class RBM(object):
         self.Winc = theano.shared(np.zeros_like(W), name='Winc')
         self.cinc = theano.shared(np.zeros_like(c), name='cinc')
         self.binc = theano.shared(np.zeros_like(b), name='binc')
+
+    def save(self, filename):
+        d = dict()
+        for k, v in self.__dict__.items():
+            if k in ['W', 'c', 'b']:
+                d[k] = v.get_value()
+            elif k in ['vis_shape', 'n_hid', 'rf_shape', 'mask', 'seed']:
+                d[k] = v
+        np.savez(filename, dict=d)
+
+    @classmethod
+    def load(cls, filename):
+        d = np.load(filename)['dict'].item()
+        return cls(**d)
 
     @property
     def filters(self):
@@ -114,15 +128,14 @@ class RBM(object):
         return hidprob, hidsamp
 
     # --- define RBM updates
-    def get_cost_updates(self, rate=0.05, weightcost=2e-4, momentum=0.5):
+    def get_cost_updates(self, data, rate=0.05, weightcost=2e-4, momentum=0.5):
 
-        numcases = self.input.shape[0]
+        numcases = data.shape[0]
         rate = tt.cast(rate, self.dtype)
         weightcost = tt.cast(weightcost, self.dtype)
         momentum = tt.cast(momentum, self.dtype)
 
         # compute positive phase
-        data = self.input
         poshidprob, poshidsamp = self.sampHgivenV(data)
 
         posprods = tt.dot(data.T, poshidprob) / numcases
@@ -146,8 +159,8 @@ class RBM(object):
         cinc = momentum * self.cinc + rate * (poshidact - neghidact)
         binc = momentum * self.binc + rate * (posvisact - negvisact)
 
-        # if self.mask is not None:
-        #     Winc = Winc * self.mask
+        if self.mask is not None:
+            Winc = Winc * self.mask
 
         updates = [
             (self.W, self.W + Winc),
@@ -160,11 +173,66 @@ class RBM(object):
 
         return err, updates
 
-# --- load the data
-# def show(flat_image, ax=None):
-#     ax = ax or plt.gca()
-#     ax.imshow(flat_image.reshape(28, 28), cmap='gray', interpolation='none')
+    @property
+    def encode(self):
+        data = tt.dmatrix('data')
+        code = self.probHgivenV(data)
+        return theano.function([data], code)
 
+    def get_output(self, images):
+        data = images if self.pre is None else self.pre.get_output(images)
+        return self.probHgivenV(data)
+
+    def get_reconstruction(self, code):
+        data = self.probVgivenH(code)
+        return (data if self.pre is None else
+                self.pre.get_reconstruction(data))
+
+    @property
+    def reconstruct(self):
+        assert self.post is None
+        images = tt.dmatrix('images')
+        output = self.get_output(images)
+        recons = self.get_reconstruction(output)
+        return theano.function([images], recons)
+
+    def pretrain(self, batches, test_images, n_epochs=10):
+
+        data = tt.dmatrix('data')
+        cost, updates = self.get_cost_updates(data)
+        train_rbm = theano.function(
+            [data], cost, updates=updates)
+
+        for epoch in range(n_epochs):
+
+            costs = []
+            for batch in batches:
+                costs.append(train_rbm(batch))
+
+            print "Epoch %d: %0.3f" % (epoch, np.mean(costs))
+
+            plt.figure(2)
+            plt.clf()
+            recons = self.reconstruct(test_images)
+            plotting.compare([test_images.reshape(-1, 28, 28),
+                              recons.reshape(-1, 28, 28)],
+                             rows=5, cols=20)
+
+            if self.pre is None:
+                # plot filters for first layer only
+                plt.figure(3)
+                plt.clf()
+                plotting.filters(self.filters, rows=10, cols=20)
+
+            plt.draw()
+
+
+def link_rbms(pre, post):
+    pre.post = post
+    post.pre = pre
+
+
+# --- load the data
 filename = 'mnist.pkl.gz'
 
 if not os.path.exists(filename):
@@ -174,64 +242,42 @@ if not os.path.exists(filename):
 with gzip.open(filename, 'rb') as f:
     train, valid, test = pickle.load(f)
 
-
-if 0:
-    # make each pixel zero mean and unit std
-    for images, labels in [train, valid, test]:
-        images -= images.mean(axis=0, keepdims=True)
-        images /= np.maximum(images.std(axis=0, keepdims=True), 1e-3)
-
-
-if 1:
-    plt.figure(1)
-    plt.clf()
-    # print train[0][10]
-    plotting.show(train[0][10].reshape(28, 28))
-
-
 # --- train
+shapes = [(28, 28), 500, 200, 50]
+rf_shapes = [(9, 9), None, None]
+assert len(shapes) == len(rf_shapes) + 1
+
 images, labels = train
-n_epochs = 10
-n_vis = images.shape[1]
-n_hid = 500
-
+test_images = images[:100]
+n_epochs = 2
 batch_size = 100
-batches = images.reshape(
-    images.shape[0] / batch_size, batch_size, images.shape[1])
 
-# rbm = RBM(n_vis, n_hid)
-# rbm = RBM((28, 28), n_hid)
-rbm = RBM((28, 28), n_hid, rf_shape=(9, 9))
-cost, updates = rbm.get_cost_updates()
+data = images
+rbms = []
+for i in range(len(rf_shapes)):
+    savename = "layer%d.npz" % i
+    if not os.path.exists(savename):
+        batches = data.reshape(
+            data.shape[0] / batch_size, batch_size, data.shape[1])
 
-train_rbm = theano.function([rbm.input], cost,
-                            updates=updates)
+        rbm = RBM(shapes[i], shapes[i+1], rf_shape=rf_shapes[i])
+        if len(rbms) > 0:
+            link_rbms(rbms[-1], rbm)
+
+        rbm.pretrain(batches, test_images, n_epochs=n_epochs)
+        rbm.save(savename)
+    else:
+        rbm = RBM.load(savename)
+        if len(rbms) > 0:
+            link_rbms(rbms[-1], rbm)
+
+    data = rbm.encode(data)
+    rbms.append(rbm)
 
 
-hp = rbm.probHgivenV(rbm.input)
-vp = rbm.probVgivenH(hp)
-reconstruct_rbm = theano.function([rbm.input], vp)
-
-reconstruct_rbm(batches[0])
-
-for epoch in range(n_epochs):
-
-    costs = []
-    for batch in batches:
-        costs.append(train_rbm(batch))
-
-    print "Epoch %d: %0.3f" % (epoch, np.mean(costs))
-
-    # weights = rbm.W.get_value()
-    plt.figure(2)
-    plt.clf()
-    # plotting.filters(weights.T.reshape(-1, 28, 28), rows=5, cols=10)
-    plotting.filters(rbm.filters, rows=10, cols=20)
-
-    test_batch = batches[0]
-    recons = reconstruct_rbm(test_batch)
-    plt.figure(3)
-    plt.clf()
-    plotting.compare([test_batch.reshape(-1, 28, 28), recons.reshape(-1, 28, 28)], rows=5, cols=20)
-
-    plt.draw()
+plt.figure(99)
+plt.clf()
+recons = rbm.reconstruct(test_images)
+plotting.compare([test_images.reshape(-1, 28, 28),
+                  recons.reshape(-1, 28, 28)],
+                 rows=5, cols=20)
