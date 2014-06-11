@@ -290,7 +290,7 @@ class DBN(object):
 
         # --- compute backprop function
         dtype = self.rbms[0].dtype
-        rate = tt.cast(0.0001, dtype)
+        rate = tt.cast(0.002, dtype)
 
         batch = tt.matrix('batch', dtype=dtype)
         targets = tt.matrix('targets', dtype=dtype)
@@ -319,6 +319,7 @@ class DBN(object):
         categories, vocab = self.get_categories_vocab(train, normalize=False)
         targets = np.zeros((images.shape[0], vocab.shape[1]), dtype=vocab.dtype)
         for category, pointer in zip(categories, vocab):
+            pointer[:] = np.random.normal(size=pointer.shape)
             targets[labels == category] = pointer
 
         # --- begin backprop
@@ -372,11 +373,8 @@ test_images = images[:100]
 n_epochs = 15
 batch_size = 100
 
-data = images
-# rbms = []
-
 dbn = DBN()
-
+data = images
 for i in range(n_layers):
     savename = "layer%d.npz" % i
     if not os.path.exists(savename):
@@ -406,4 +404,4 @@ plotting.compare([test_images.reshape(-1, 28, 28),
 print "mean error", dbn.test(train, test).mean()
 
 # --- train with backprop
-dbn.backprop(train, test)
+dbn.backprop(train, test, n_epochs=100)
