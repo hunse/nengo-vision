@@ -3,6 +3,7 @@ Train an MNIST RBM, based off the demo code at
     http://www.cs.toronto.edu/~hinton/MatlabForSciencePaper.html
 """
 
+import collections
 import os
 import gzip
 import cPickle as pickle
@@ -19,21 +20,24 @@ import plotting
 plt.ion()
 
 
+def norm(x, **kwargs):
+    return np.sqrt((x**2).sum(**kwargs))
+
+
 class RBM(object):
 
     # --- define RBM parameters
     def __init__(self, vis_shape, n_hid,
                  W=None, c=None, b=None, mask=None,
-                 gaussian=None, rf_shape=None, seed=9):
+                 rf_shape=None, hidlinear=False, seed=9):
         self.dtype = theano.config.floatX
 
         self.vis_shape = vis_shape if isinstance(vis_shape, tuple) else (vis_shape,)
         self.n_vis = np.prod(vis_shape)
         self.n_hid = n_hid
-        self.gaussian = gaussian
+        # self.gaussian = gaussian
+        self.hidlinear = hidlinear
         self.seed = seed
-        self.pre = None
-        self.post = None
 
         rng = np.random.RandomState(seed=self.seed)
         self.theano_rng = theano.sandbox.rng_mrg.MRG_RandomStreams(seed=self.seed)
@@ -109,28 +113,35 @@ class RBM(object):
 
     # --- define RBM propagation functions
     def probHgivenV(self, vis):
-        hidprob = tt.nnet.sigmoid(tt.dot(vis, self.W) + self.c)
-        return hidprob
+        x = tt.dot(vis, self.W) + self.c
+        if self.hidlinear:
+            return x
+        else:
+            return tt.nnet.sigmoid(x)
 
     def probVgivenH(self, hid):
         a = tt.dot(hid, self.W.T) + self.b
-        if self.gaussian is None:
-            visprob = tt.nnet.sigmoid(a)
-        else:
-            visprob = self.gaussian * a
+        # if self.gaussian is None:
+        visprob = tt.nnet.sigmoid(a)
+        # else:
+        #     visprob = self.gaussian * a
 
         return visprob
 
     def sampHgivenV(self, vis):
         hidprob = self.probHgivenV(vis)
-        hidsamp = self.theano_rng.binomial(
-            size=hidprob.shape, n=1, p=hidprob, dtype=self.dtype)
+        if self.hidlinear:
+            hidsamp = hidprob + self.theano_rng.normal(
+                size=hidprob.shape, dtype=self.dtype)
+        else:
+            hidsamp = self.theano_rng.binomial(
+                size=hidprob.shape, n=1, p=hidprob, dtype=self.dtype)
         return hidprob, hidsamp
 
     # --- define RBM updates
-    def get_cost_updates(self, data, rate=0.05, weightcost=2e-4, momentum=0.5):
+    def get_cost_updates(self, data, rate=0.1, weightcost=2e-4, momentum=0.5):
 
-        numcases = data.shape[0]
+        numcases = tt.cast(data.shape[0], self.dtype)
         rate = tt.cast(rate, self.dtype)
         weightcost = tt.cast(weightcost, self.dtype)
         momentum = tt.cast(momentum, self.dtype)
@@ -175,61 +186,165 @@ class RBM(object):
 
     @property
     def encode(self):
-        data = tt.dmatrix('data')
+        data = tt.matrix('data', dtype=self.dtype)
         code = self.probHgivenV(data)
         return theano.function([data], code)
 
-    def get_output(self, images):
-        data = images if self.pre is None else self.pre.get_output(images)
-        return self.probHgivenV(data)
+    def pretrain(self, batches, dbn=None, test_images=None,
+                 n_epochs=10, **train_params):
 
-    def get_reconstruction(self, code):
-        data = self.probVgivenH(code)
-        return (data if self.pre is None else
-                self.pre.get_reconstruction(data))
-
-    @property
-    def reconstruct(self):
-        assert self.post is None
-        images = tt.dmatrix('images')
-        output = self.get_output(images)
-        recons = self.get_reconstruction(output)
-        return theano.function([images], recons)
-
-    def pretrain(self, batches, test_images, n_epochs=10):
-
-        data = tt.dmatrix('data')
-        cost, updates = self.get_cost_updates(data)
-        train_rbm = theano.function(
-            [data], cost, updates=updates)
+        data = tt.matrix('data', dtype=self.dtype)
+        cost, updates = self.get_cost_updates(data, **train_params)
+        train_rbm = theano.function([data], cost, updates=updates)
 
         for epoch in range(n_epochs):
 
+            # train on each mini-batch
             costs = []
             for batch in batches:
                 costs.append(train_rbm(batch))
 
             print "Epoch %d: %0.3f" % (epoch, np.mean(costs))
 
-            plt.figure(2)
-            plt.clf()
-            recons = self.reconstruct(test_images)
-            plotting.compare([test_images.reshape(-1, 28, 28),
-                              recons.reshape(-1, 28, 28)],
-                             rows=5, cols=20)
+            if dbn is not None and test_images is not None:
+                # plot reconstructions on test set
+                plt.figure(2)
+                plt.clf()
+                recons = dbn.reconstruct(test_images)
+                plotting.compare([test_images.reshape(-1, 28, 28),
+                                  recons.reshape(-1, 28, 28)],
+                                 rows=5, cols=20)
+                plt.draw()
 
-            if self.pre is None:
-                # plot filters for first layer only
+            # plot filters for first layer only
+            if dbn is not None and self is dbn.rbms[0]:
                 plt.figure(3)
                 plt.clf()
                 plotting.filters(self.filters, rows=10, cols=20)
+                plt.draw()
 
-            plt.draw()
 
+class DBN(object):
 
-def link_rbms(pre, post):
-    pre.post = post
-    post.pre = pre
+    def __init__(self, rbms=None):
+        self.dtype = theano.config.floatX
+        self.rbms = rbms if rbms is not None else []
+
+    # def encode(self, images):
+    #     data = images if self.pre is None else self.pre.encode(images)
+    #     return self.probHgivenV(data)
+
+    # def decode(self, code):
+    #     data = self.probVgivenH(code)
+    #     return data if self.pre is None else self.pre.decode(data)
+
+    def propup(self, images):
+        codes = images
+        for rbm in self.rbms:
+            codes = rbm.probHgivenV(codes)
+        return codes
+
+    def propdown(self, codes):
+        images = codes
+        for rbm in self.rbms[::-1]:
+            images = rbm.probVgivenH(images)
+        return images
+
+    @property
+    def encode(self):
+        images = tt.matrix('images', dtype=self.dtype)
+        codes = self.propup(images)
+        return theano.function([images], codes)
+
+    @property
+    def decode(self):
+        codes = tt.matrix('codes', dtype=self.dtype)
+        images = self.propdown(codes)
+        return theano.function([codes], images)
+
+    @property
+    def reconstruct(self):
+        images = tt.matrix('images', dtype=self.dtype)
+        codes = self.propup(images)
+        recons = self.propdown(codes)
+        return theano.function([images], recons)
+
+    def get_categories_vocab(self, train_set, normalize=True):
+        images, labels = train_set
+
+        # find mean codes for each label
+        codes = dbn.encode(images)
+        categories = np.unique(labels)
+        vocab = []
+        for category in categories:
+            pointer = codes[labels == category].mean(0)
+            vocab.append(pointer)
+
+        vocab = np.array(vocab, dtype=codes.dtype)
+        if normalize:
+            vocab /= norm(vocab, axis=1, keepdims=True)
+
+        return categories, vocab
+
+    def backprop(self, train, test, n_epochs=30):
+
+        # --- compute backprop function
+        dtype = self.rbms[0].dtype
+        rate = tt.cast(0.0001, dtype)
+
+        batch = tt.matrix('batch', dtype=dtype)
+        targets = tt.matrix('targets', dtype=dtype)
+
+        # compute coding error
+        codes = self.propup(batch)
+        rmses = tt.sqrt(tt.sum((codes - targets)**2, axis=1))
+        error = tt.sum(rmses)
+
+        # compute gradients
+        params = []
+        for rbm in self.rbms:
+            params.extend([rbm.W, rbm.c])
+
+        updates = collections.OrderedDict()
+        grads = tt.grad(error, params)
+        for param, grad in zip(params, grads):
+            updates[param] = param - rate * grad
+
+        train_dbn = theano.function([batch, targets], error, updates=updates)
+
+        # --- find target codes
+        images, labels = train
+
+        # find mean codes for each label
+        categories, vocab = self.get_categories_vocab(train, normalize=False)
+        targets = np.zeros((images.shape[0], vocab.shape[1]), dtype=vocab.dtype)
+        for category, pointer in zip(categories, vocab):
+            targets[labels == category] = pointer
+
+        # --- begin backprop
+        batch_size = 5000
+        ibatches = images.reshape(-1, batch_size, images.shape[1])
+        tbatches = targets.reshape(-1, batch_size, targets.shape[1])
+
+        for epoch in range(n_epochs):
+            costs = []
+            for batch, targ in zip(ibatches, tbatches):
+                costs.append(train_dbn(batch, targ))
+
+            print "Epoch %d: %0.3f" % (epoch, np.mean(costs))
+            print self.test(train, test).mean()
+
+    def test(self, train_set, test_set):
+        # find vocabulary pointers on training set
+        categories, vocab = self.get_categories_vocab(train_set)
+
+        # encode test set and compare to vocab pointers
+        images, labels = test_set
+        codes = self.encode(images)
+        dots = np.dot(codes, vocab.T)
+        tlabels = categories[np.argmax(dots, axis=1)]
+        errors = (tlabels != labels)
+        return errors
 
 
 # --- load the data
@@ -242,42 +357,53 @@ if not os.path.exists(filename):
 with gzip.open(filename, 'rb') as f:
     train, valid, test = pickle.load(f)
 
-# --- train
+# --- pretrain with CD
 shapes = [(28, 28), 500, 200, 50]
+n_layers = len(shapes) - 1
 rf_shapes = [(9, 9), None, None]
-assert len(shapes) == len(rf_shapes) + 1
+hidlinear = [False, False, True]
+rates = [0.1, 0.1, 0.001]
+assert len(rf_shapes) == n_layers
+assert len(hidlinear) == n_layers
+assert len(rates) == n_layers
 
 images, labels = train
 test_images = images[:100]
-n_epochs = 2
+n_epochs = 15
 batch_size = 100
 
 data = images
-rbms = []
-for i in range(len(rf_shapes)):
+# rbms = []
+
+dbn = DBN()
+
+for i in range(n_layers):
     savename = "layer%d.npz" % i
     if not os.path.exists(savename):
         batches = data.reshape(
             data.shape[0] / batch_size, batch_size, data.shape[1])
 
-        rbm = RBM(shapes[i], shapes[i+1], rf_shape=rf_shapes[i])
-        if len(rbms) > 0:
-            link_rbms(rbms[-1], rbm)
-
-        rbm.pretrain(batches, test_images, n_epochs=n_epochs)
+        rbm = RBM(shapes[i], shapes[i+1],
+                  rf_shape=rf_shapes[i], hidlinear=hidlinear[i])
+        dbn.rbms.append(rbm)
+        rbm.pretrain(batches, dbn, test_images,
+                     n_epochs=n_epochs, rate=rates[i])
         rbm.save(savename)
     else:
         rbm = RBM.load(savename)
-        if len(rbms) > 0:
-            link_rbms(rbms[-1], rbm)
+        dbn.rbms.append(rbm)
 
     data = rbm.encode(data)
-    rbms.append(rbm)
 
 
 plt.figure(99)
 plt.clf()
-recons = rbm.reconstruct(test_images)
+recons = dbn.reconstruct(test_images)
 plotting.compare([test_images.reshape(-1, 28, 28),
                   recons.reshape(-1, 28, 28)],
                  rows=5, cols=20)
+
+print "mean error", dbn.test(train, test).mean()
+
+# --- train with backprop
+dbn.backprop(train, test)
