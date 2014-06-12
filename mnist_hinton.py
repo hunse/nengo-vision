@@ -11,6 +11,8 @@ import urllib
 
 import numpy as np
 import matplotlib.pyplot as plt
+
+# os.environ['THEANO_FLAGS'] = 'device=gpu, floatX=float32'
 import theano
 import theano.tensor as tt
 import theano.sandbox.rng_mrg
@@ -29,7 +31,7 @@ class RBM(object):
     # --- define RBM parameters
     def __init__(self, vis_shape, n_hid,
                  W=None, c=None, b=None, mask=None,
-                 rf_shape=None, hidlinear=False, seed=9):
+                 rf_shape=None, hidlinear=False, seed=22):
         self.dtype = theano.config.floatX
 
         self.vis_shape = vis_shape if isinstance(vis_shape, tuple) else (vis_shape,)
@@ -229,6 +231,7 @@ class DBN(object):
     def __init__(self, rbms=None):
         self.dtype = theano.config.floatX
         self.rbms = rbms if rbms is not None else []
+        self.classifier = None
 
     # def encode(self, images):
     #     data = images if self.pre is None else self.pre.encode(images)
@@ -287,21 +290,31 @@ class DBN(object):
         return categories, vocab
 
     def backprop(self, train, test, n_epochs=30):
+        categories = np.unique(train[1])  # unique labels
 
         # --- compute backprop function
         dtype = self.rbms[0].dtype
-        rate = tt.cast(0.002, dtype)
+        rate = tt.cast(10., dtype)
 
         batch = tt.matrix('batch', dtype=dtype)
         targets = tt.matrix('targets', dtype=dtype)
 
+        if self.classifier is None:
+            classifier0 = np.random.normal(
+                size=(self.rbms[-1].n_hid, 10)).astype(dtype)
+        else:
+            classifier0 = self.classifier
+        classifier = theano.shared(classifier0, name='classifier')
+
         # compute coding error
         codes = self.propup(batch)
-        rmses = tt.sqrt(tt.sum((codes - targets)**2, axis=1))
-        error = tt.sum(rmses)
+        outputs = tt.nnet.softmax(tt.dot(codes, classifier))
+        rmses = tt.sqrt(tt.sum((outputs - targets)**2, axis=1))
+        # rmses = tt.sum(tt.abs_(outputs - targets), axis=1)
+        error = tt.mean(rmses)
 
         # compute gradients
-        params = []
+        params = [classifier]
         for rbm in self.rbms:
             params.extend([rbm.W, rbm.c])
 
@@ -315,25 +328,25 @@ class DBN(object):
         # --- find target codes
         images, labels = train
 
-        # find mean codes for each label
-        categories, vocab = self.get_categories_vocab(train, normalize=False)
-        targets = np.zeros((images.shape[0], vocab.shape[1]), dtype=vocab.dtype)
-        for category, pointer in zip(categories, vocab):
-            pointer[:] = np.random.normal(size=pointer.shape)
-            targets[labels == category] = pointer
+        targets = np.zeros((images.shape[0], 10), dtype=dtype)
+        for i, category in enumerate(categories):
+            target = np.zeros(10)
+            target[i] = 1
+            targets[category == labels] = target
 
         # --- begin backprop
-        batch_size = 5000
+        batch_size = 1000
+
         ibatches = images.reshape(-1, batch_size, images.shape[1])
         tbatches = targets.reshape(-1, batch_size, targets.shape[1])
 
         for epoch in range(n_epochs):
             costs = []
-            for batch, targ in zip(ibatches, tbatches):
-                costs.append(train_dbn(batch, targ))
+            for batch, target in zip(ibatches, tbatches):
+                costs.append(train_dbn(batch, target))
 
+            self.classifier = classifier.get_value()
             print "Epoch %d: %0.3f" % (epoch, np.mean(costs))
-            print self.test(train, test).mean()
 
     def test(self, train_set, test_set):
         # find vocabulary pointers on training set
